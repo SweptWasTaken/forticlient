@@ -158,22 +158,6 @@ jobs:
           echo "VERSION=$VERSION"   >> $GITHUB_ENV
           echo "PKG_SRC=$PKG_SRC"  >> $GITHUB_ENV
 
-      # ── 7. Check for duplicate release ──────────────────────────────────────
-      - name: Check if release already exists
-        id: check_release
-        run: |
-          TAG="v${{ env.VERSION }}"
-          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
-
-          if [ "$HTTP" = "200" ] && [ "${{ inputs.force_release }}" != "true" ]; then
-            echo "Release $TAG already exists — skipping."
-            echo "SKIP=true" >> $GITHUB_OUTPUT
-          else
-            echo "SKIP=false" >> $GITHUB_OUTPUT
-          fi
-
       # ── 8. Copy PKG with stable filename ────────────────────────────────────
       - name: Stage PKG with stable filename
         if: steps.check_release.outputs.SKIP != 'true'
