@@ -60,12 +60,6 @@ jobs:
           echo "STUB_VOLUME=$STUB_VOLUME" >> $GITHUB_ENV
 
       # ── 3. Run FortiClientInstaller binary to download the full installer ────
-      #
-      # This binary lives at Contents/MacOS/FortiClientInstaller inside the DMG.
-      # When run with sudo it downloads the real FortiClient installer to a temp
-      # folder and prints a line like:
-      #   "Download FortiClient Connect successfully. Copy it to /var/folders/.../FortiClient.dmg"
-      #
       - name: Run FortiClientInstaller binary
         timeout-minutes: 15
         run: |
@@ -73,18 +67,43 @@ jobs:
 
           if [ -z "$INSTALLER" ]; then
             echo "ERROR: FortiClientInstaller binary not found under $STUB_VOLUME"
-            echo "Contents of stub DMG:"
             find "$STUB_VOLUME" -type f
             exit 1
           fi
 
           echo "Found binary: $INSTALLER"
 
-          # Run with sudo; tee captures both stdout and stderr for path parsing
-          sudo "$INSTALLER" > /tmp/fc_installer.log 2>&1 || true
+          # Run in background — the binary never exits on its own
+          sudo "$INSTALLER" > /tmp/fc_installer.log 2>&1 &
+          FC_PID=$!
+          echo "Installer running as PID $FC_PID"
+
+          # Poll the log every 10s until we see the "Copy it to" line
+          TIMEOUT=600   # 10 minutes max
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            if grep -q "Copy it to" /tmp/fc_installer.log 2>/dev/null; then
+              echo "Download complete after ${ELAPSED}s."
+              break
+            fi
+            sleep 10
+            ELAPSED=$((ELAPSED + 10))
+            echo "  ...waiting (${ELAPSED}s elapsed)"
+          done
+
+          # Kill the installer — we have what we need
+          sudo kill "$FC_PID" 2>/dev/null || true
+
+          # Fail explicitly if we timed out without finding the path
+          if ! grep -q "Copy it to" /tmp/fc_installer.log; then
+            echo "ERROR: Timed out waiting for download. Installer log:"
+            cat /tmp/fc_installer.log
+            exit 1
+          fi
 
           echo "=== Installer output ==="
           cat /tmp/fc_installer.log
+
 
       # ── 4. Parse the downloaded full-installer DMG path from log output ──────
       - name: Parse full installer DMG path from log
