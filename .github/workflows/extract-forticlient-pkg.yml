@@ -26,84 +26,65 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 1. Download stub installer ───────────────────────────────────────────
-      - name: Download FortiClient stub installer DMG
+# ── 1. Resolve redirect and extract version ──────────────────────────────
+      #
+      # https://links.fortinet.com/forticlient/mac/vpnagent redirects to a URL like:
+      # https://filestore.fortinet.com/forticlient/downloads/FortiClientVPN_7.4.3.4323_OnlineInstaller.dmg
+      # The version lives in that final URL — no need to inspect the PKG at all.
+      #
+      - name: Resolve download URL and detect version
         run: |
-          URL="${{ inputs.download_url || vars.FORTICLIENT_DMG_URL }}"
+          BASE_URL="${{ inputs.download_url || vars.FORTICLIENT_DMG_URL }}"
 
-          if [ -z "$URL" ]; then
+          if [ -z "$BASE_URL" ]; then
             echo "ERROR: No download URL provided."
-            echo "  Manual run:   fill in the 'download_url' input."
+            echo "  Manual run:    fill in the 'download_url' input."
             echo "  Scheduled run: set FORTICLIENT_DMG_URL in repo Actions variables."
             exit 1
           fi
 
-          echo "Downloading stub from: $URL"
+          # Follow all redirects, capture the final URL without downloading the file
+          FINAL_URL=$(curl -Ls -o /dev/null -w '%{url_effective}' "$BASE_URL")
+          echo "Resolved URL: $FINAL_URL"
+
+          # Extract version: FortiClientVPN_7.4.3.4323_OnlineInstaller.dmg → 7.4.3.4323
+          VERSION=$(echo "$FINAL_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Could not parse version from resolved URL: $FINAL_URL"
+            exit 1
+          fi
+
+          echo "Detected version: $VERSION"
+          echo "VERSION=$VERSION"     >> $GITHUB_ENV
+          echo "FINAL_URL=$FINAL_URL" >> $GITHUB_ENV
+
+      # ── 2. Check for duplicate release (before downloading anything) ─────────
+      - name: Check if release already exists
+        id: check_release
+        run: |
+          TAG="v${{ env.VERSION }}"
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+
+          if [ "$HTTP" = "200" ] && [ "${{ inputs.force_release }}" != "true" ]; then
+            echo "Release $TAG already exists — skipping."
+            echo "SKIP=true" >> $GITHUB_OUTPUT
+          else
+            echo "SKIP=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 3. Download stub installer DMG ───────────────────────────────────────
+      - name: Download FortiClient stub installer DMG
+        if: steps.check_release.outputs.SKIP != 'true'
+        run: |
+          # Use the already-resolved URL directly — no second redirect needed
+          echo "Downloading $FINAL_URL"
           curl -L --retry 3 --retry-delay 10 --progress-bar \
-            -o FortiClientStub.dmg "$URL"
+            -o FortiClientStub.dmg "$FINAL_URL"
 
           ls -lh FortiClientStub.dmg
-
-      # ── 2. Mount stub DMG ────────────────────────────────────────────────────
-      - name: Mount stub DMG
-        run: |
-          ATTACH_OUT=$(hdiutil attach FortiClientStub.dmg -nobrowse -noverify)
-          echo "$ATTACH_OUT"
-
-          STUB_VOLUME=$(echo "$ATTACH_OUT" | awk '/\/Volumes\//{print $NF}')
-          if [ -z "$STUB_VOLUME" ]; then
-            echo "ERROR: Could not determine stub DMG mount point."
-            exit 1
-          fi
-
-          echo "Stub mounted at: $STUB_VOLUME"
-          echo "STUB_VOLUME=$STUB_VOLUME" >> $GITHUB_ENV
-
-      # ── 3. Run FortiClientInstaller binary to download the full installer ────
-      - name: Run FortiClientInstaller binary
-        timeout-minutes: 15
-        run: |
-          INSTALLER=$(find "$STUB_VOLUME" -name "FortiClientInstaller" -type f | head -1)
-
-          if [ -z "$INSTALLER" ]; then
-            echo "ERROR: FortiClientInstaller binary not found under $STUB_VOLUME"
-            find "$STUB_VOLUME" -type f
-            exit 1
-          fi
-
-          echo "Found binary: $INSTALLER"
-
-          # Run in background — the binary never exits on its own
-          sudo "$INSTALLER" > /tmp/fc_installer.log 2>&1 &
-          FC_PID=$!
-          echo "Installer running as PID $FC_PID"
-
-          # Poll the log every 10s until we see the "Copy it to" line
-          TIMEOUT=600   # 10 minutes max
-          ELAPSED=0
-          while [ $ELAPSED -lt $TIMEOUT ]; do
-            if grep -q "Copy it to" /tmp/fc_installer.log 2>/dev/null; then
-              echo "Download complete after ${ELAPSED}s."
-              break
-            fi
-            sleep 10
-            ELAPSED=$((ELAPSED + 10))
-            echo "  ...waiting (${ELAPSED}s elapsed)"
-          done
-
-          # Kill the installer — we have what we need
-          sudo kill "$FC_PID" 2>/dev/null || true
-
-          # Fail explicitly if we timed out without finding the path
-          if ! grep -q "Copy it to" /tmp/fc_installer.log; then
-            echo "ERROR: Timed out waiting for download. Installer log:"
-            cat /tmp/fc_installer.log
-            exit 1
-          fi
-
-          echo "=== Installer output ==="
-          cat /tmp/fc_installer.log
-
 
 # ── 4. Parse the downloaded full-installer DMG path from log ──────────────
       - name: Parse full installer DMG path from log
