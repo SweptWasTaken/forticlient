@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       download_url:
-        description: "Direct DMG download URL (paste from Fortinet downloads page)"
+        description: "Direct stub DMG download URL (from Fortinet downloads page)"
         required: true
         type: string
       force_release:
@@ -14,87 +14,150 @@ on:
         type: boolean
         default: false
   schedule:
-    # Runs every Monday at 06:00 UTC — adjust or remove as needed
     - cron: "0 6 * * 1"
 
 jobs:
   extract-and-release:
     runs-on: macos-latest
     permissions:
-      contents: write # Required to create releases
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 1. Download ──────────────────────────────────────────────────────────
-      - name: Download FortiClient DMG
+      # ── 1. Download stub installer ───────────────────────────────────────────
+      - name: Download FortiClient stub installer DMG
         run: |
-          # For scheduled runs, set DOWNLOAD_URL as a repo secret or variable.
-          # For manual runs, it comes from the workflow_dispatch input above.
           URL="${{ inputs.download_url || vars.FORTICLIENT_DMG_URL }}"
 
           if [ -z "$URL" ]; then
             echo "ERROR: No download URL provided."
-            echo "  - Manual run: fill in the 'download_url' input."
-            echo "  - Scheduled run: set the FORTICLIENT_DMG_URL Actions variable in repo settings."
+            echo "  Manual run:   fill in the 'download_url' input."
+            echo "  Scheduled run: set FORTICLIENT_DMG_URL in repo Actions variables."
             exit 1
           fi
 
-          echo "Downloading from: $URL"
+          echo "Downloading stub from: $URL"
           curl -L --retry 3 --retry-delay 10 --progress-bar \
-            -o FortiClientInstaller.dmg "$URL"
+            -o FortiClientStub.dmg "$URL"
 
-          ls -lh FortiClientInstaller.dmg
+          ls -lh FortiClientStub.dmg
 
-      # ── 2. Mount ─────────────────────────────────────────────────────────────
-      - name: Mount DMG
+      # ── 2. Mount stub DMG ────────────────────────────────────────────────────
+      - name: Mount stub DMG
         run: |
-          echo "Attaching DMG..."
-          ATTACH_OUT=$(hdiutil attach FortiClientInstaller.dmg -nobrowse -noverify)
+          ATTACH_OUT=$(hdiutil attach FortiClientStub.dmg -nobrowse -noverify)
           echo "$ATTACH_OUT"
 
-          # Grab the /Volumes/... mount point from the last column of hdiutil output
-          VOLUME=$(echo "$ATTACH_OUT" | awk '/\/Volumes\//{print $NF}')
-
-          if [ -z "$VOLUME" ]; then
-            echo "ERROR: Could not determine mount point."
+          STUB_VOLUME=$(echo "$ATTACH_OUT" | awk '/\/Volumes\//{print $NF}')
+          if [ -z "$STUB_VOLUME" ]; then
+            echo "ERROR: Could not determine stub DMG mount point."
             exit 1
           fi
 
-          echo "Mounted at: $VOLUME"
-          ls -la "$VOLUME"
-          echo "VOLUME=$VOLUME" >> $GITHUB_ENV
+          echo "Stub mounted at: $STUB_VOLUME"
+          echo "STUB_VOLUME=$STUB_VOLUME" >> $GITHUB_ENV
 
-      # ── 3. Extract version ───────────────────────────────────────────────────
+      # ── 3. Run FortiClientInstaller binary to download the full installer ────
+      #
+      # This binary lives at Contents/MacOS/FortiClientInstaller inside the DMG.
+      # When run with sudo it downloads the real FortiClient installer to a temp
+      # folder and prints a line like:
+      #   "Download FortiClient Connect successfully. Copy it to /var/folders/.../FortiClient.dmg"
+      #
+      - name: Run FortiClientInstaller binary
+        timeout-minutes: 15
+        run: |
+          INSTALLER=$(find "$STUB_VOLUME" -name "FortiClientInstaller" -type f | head -1)
+
+          if [ -z "$INSTALLER" ]; then
+            echo "ERROR: FortiClientInstaller binary not found under $STUB_VOLUME"
+            echo "Contents of stub DMG:"
+            find "$STUB_VOLUME" -type f
+            exit 1
+          fi
+
+          echo "Found binary: $INSTALLER"
+
+          # Run with sudo; tee captures both stdout and stderr for path parsing
+          sudo "$INSTALLER" > /tmp/fc_installer.log 2>&1 || true
+
+          echo "=== Installer output ==="
+          cat /tmp/fc_installer.log
+
+      # ── 4. Parse the downloaded full-installer DMG path from log output ──────
+      - name: Parse full installer DMG path from log
+        run: |
+          # Target log line:
+          # "Download FortiClient Connect successfully. Copy it to /var/folders/.../FortiClient.dmg"
+          FULL_DMG=$(grep "Copy it to" /tmp/fc_installer.log \
+            | grep -oE '/var/folders/[^ ]+' \
+            | tail -1)
+
+          # Fallback: scan /var/folders for any FortiClient DMG newer than the stub
+          if [ -z "$FULL_DMG" ]; then
+            echo "Primary parse found nothing — falling back to filesystem search..."
+            FULL_DMG=$(find /var/folders -name "FortiClient*.dmg" \
+              -newer FortiClientStub.dmg 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$FULL_DMG" ] || [ ! -f "$FULL_DMG" ]; then
+            echo "ERROR: Could not locate downloaded FortiClient DMG."
+            echo "Full installer log:"
+            cat /tmp/fc_installer.log
+            exit 1
+          fi
+
+          echo "Full installer DMG: $FULL_DMG"
+          ls -lh "$FULL_DMG"
+          echo "FULL_DMG=$FULL_DMG" >> $GITHUB_ENV
+
+      # ── 5. Mount the full installer DMG ─────────────────────────────────────
+      - name: Mount full installer DMG
+        run: |
+          ATTACH_OUT=$(hdiutil attach "$FULL_DMG" -nobrowse -noverify)
+          echo "$ATTACH_OUT"
+
+          FULL_VOLUME=$(echo "$ATTACH_OUT" | awk '/\/Volumes\//{print $NF}')
+          if [ -z "$FULL_VOLUME" ]; then
+            echo "ERROR: Could not mount full installer DMG."
+            exit 1
+          fi
+
+          echo "Full installer mounted at: $FULL_VOLUME"
+          ls -la "$FULL_VOLUME"
+          echo "FULL_VOLUME=$FULL_VOLUME" >> $GITHUB_ENV
+
+      # ── 6. Detect version ────────────────────────────────────────────────────
       - name: Detect version
         run: |
-          # First try: read the version from inside the Distribution XML in the .mpkg.
-          # This is the most reliable source.
-          MPKG=$(find "$VOLUME" -name "*.mpkg" | head -1)
+          PKG_SRC=$(find "$FULL_VOLUME" \( -name "*.pkg" -o -name "*.mpkg" \) | head -1)
+          echo "PKG source: $PKG_SRC"
 
-          if [ -n "$MPKG" ]; then
-            pkgutil --expand "$MPKG" /tmp/fc_pkg_expanded 2>/dev/null || true
-            VERSION=$(grep -oE 'version="[0-9][0-9.]*"' \
-              /tmp/fc_pkg_expanded/Distribution 2>/dev/null \
-              | head -1 | grep -oE '[0-9][0-9.]*')
-          fi
+          # Best source: Distribution XML inside the package
+          pkgutil --expand "$PKG_SRC" /tmp/fc_expanded 2>/dev/null || true
+          VERSION=$(grep -oE 'version="[0-9][0-9.]*"' \
+            /tmp/fc_expanded/Distribution 2>/dev/null \
+            | head -1 | grep -oE '[0-9][0-9.]*')
 
-          # Fallback: parse the version from the DMG volume label
+          # Fallback: parse from the DMG volume label
           if [ -z "$VERSION" ]; then
-            VERSION=$(echo "$VOLUME" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+            VERSION=$(echo "$FULL_VOLUME" \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
           fi
 
-          # Last resort: use today's date so the workflow never hard-fails
+          # Last resort: date stamp so the workflow never hard-fails
           if [ -z "$VERSION" ]; then
             VERSION=$(date +%Y.%m.%d)
-            echo "WARNING: Could not detect version — using date fallback: $VERSION"
+            echo "WARNING: Version not detected — using date fallback: $VERSION"
           fi
 
           echo "Detected version: $VERSION"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION=$VERSION"   >> $GITHUB_ENV
+          echo "PKG_SRC=$PKG_SRC"  >> $GITHUB_ENV
 
-      # ── 4. Check for duplicate release ──────────────────────────────────────
+      # ── 7. Check for duplicate release ──────────────────────────────────────
       - name: Check if release already exists
         id: check_release
         run: |
@@ -110,37 +173,40 @@ jobs:
             echo "SKIP=false" >> $GITHUB_OUTPUT
           fi
 
-      # ── 5. Copy + rename the package ────────────────────────────────────────
-      - name: Extract and rename PKG
+      # ── 8. Copy PKG with stable filename ────────────────────────────────────
+      - name: Stage PKG with stable filename
         if: steps.check_release.outputs.SKIP != 'true'
         run: |
-          MPKG=$(find "$VOLUME" -name "*.mpkg" | head -1)
+          # Fixed filename is what makes /releases/latest/download/FortiClientVPN.pkg stable
+          cp "$PKG_SRC" FortiClientVPN.pkg
+          ls -lh FortiClientVPN.pkg
 
-          if [ -z "$MPKG" ]; then
-            echo "ERROR: No .mpkg found in $VOLUME"
-            ls -laR "$VOLUME"
-            exit 1
-          fi
-
-          echo "Found: $MPKG"
-          # Fixed filename — this is what makes the /latest/download/ URL stable
-          PKG_NAME="FortiClientVPN.pkg"
-          cp "$MPKG" "$PKG_NAME"
-          ls -lh "$PKG_NAME"
-          echo "PKG_NAME=$PKG_NAME" >> $GITHUB_ENV
-
-      # ── 6. Publish release ───────────────────────────────────────────────────
+      # ── 9. Publish GitHub Release ────────────────────────────────────────────
       - name: Create GitHub Release
         if: steps.check_release.outputs.SKIP != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
           name: "FortiClient VPN ${{ env.VERSION }}"
-          make_latest: true   # ← ensures /releases/latest/ always points here
-          files: ${{ env.PKG_NAME }}
+          make_latest: true
+          body: |
+            **FortiClient VPN** — macOS offline installer PKG
 
-      # ── 7. Cleanup (always runs) ─────────────────────────────────────────────
-      - name: Detach DMG
+            | Field | Value |
+            |---|---|
+            | Version | `${{ env.VERSION }}` |
+            | Run | `${{ github.run_id }}` |
+            | Trigger | `${{ github.event_name }}` |
+
+            > PKG extracted from the official Fortinet stub installer for Mosyle MDM deployment.
+            >
+            > **Stable MDM URL (never changes):**
+            > `https://github.com/${{ github.repository }}/releases/latest/download/FortiClientVPN.pkg`
+          files: FortiClientVPN.pkg
+
+      # ── 10. Cleanup (always runs) ────────────────────────────────────────────
+      - name: Detach DMG volumes
         if: always()
         run: |
-          hdiutil detach "${{ env.VOLUME }}" -quiet 2>/dev/null || true
+          hdiutil detach "${{ env.FULL_VOLUME }}" -quiet 2>/dev/null || true
+          hdiutil detach "${{ env.STUB_VOLUME }}"  -quiet 2>/dev/null || true
