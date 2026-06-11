@@ -1,0 +1,156 @@
+# .github/workflows/extract-forticlient-pkg.yml
+
+name: Extract FortiClient VPN PKG
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: "Direct DMG download URL (paste from Fortinet downloads page)"
+        required: true
+        type: string
+      force_release:
+        description: "Re-release even if this version tag already exists"
+        type: boolean
+        default: false
+  schedule:
+    # Runs every Monday at 06:00 UTC — adjust or remove as needed
+    - cron: "0 6 * * 1"
+
+jobs:
+  extract-and-release:
+    runs-on: macos-latest
+    permissions:
+      contents: write # Required to create releases
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 1. Download ──────────────────────────────────────────────────────────
+      - name: Download FortiClient DMG
+        run: |
+          # For scheduled runs, set DOWNLOAD_URL as a repo secret or variable.
+          # For manual runs, it comes from the workflow_dispatch input above.
+          URL="${{ inputs.download_url || vars.FORTICLIENT_DMG_URL }}"
+
+          if [ -z "$URL" ]; then
+            echo "ERROR: No download URL provided."
+            echo "  - Manual run: fill in the 'download_url' input."
+            echo "  - Scheduled run: set the FORTICLIENT_DMG_URL Actions variable in repo settings."
+            exit 1
+          fi
+
+          echo "Downloading from: $URL"
+          curl -L --retry 3 --retry-delay 10 --progress-bar \
+            -o FortiClientInstaller.dmg "$URL"
+
+          ls -lh FortiClientInstaller.dmg
+
+      # ── 2. Mount ─────────────────────────────────────────────────────────────
+      - name: Mount DMG
+        run: |
+          echo "Attaching DMG..."
+          ATTACH_OUT=$(hdiutil attach FortiClientInstaller.dmg -nobrowse -noverify)
+          echo "$ATTACH_OUT"
+
+          # Grab the /Volumes/... mount point from the last column of hdiutil output
+          VOLUME=$(echo "$ATTACH_OUT" | awk '/\/Volumes\//{print $NF}')
+
+          if [ -z "$VOLUME" ]; then
+            echo "ERROR: Could not determine mount point."
+            exit 1
+          fi
+
+          echo "Mounted at: $VOLUME"
+          ls -la "$VOLUME"
+          echo "VOLUME=$VOLUME" >> $GITHUB_ENV
+
+      # ── 3. Extract version ───────────────────────────────────────────────────
+      - name: Detect version
+        run: |
+          # First try: read the version from inside the Distribution XML in the .mpkg.
+          # This is the most reliable source.
+          MPKG=$(find "$VOLUME" -name "*.mpkg" | head -1)
+
+          if [ -n "$MPKG" ]; then
+            pkgutil --expand "$MPKG" /tmp/fc_pkg_expanded 2>/dev/null || true
+            VERSION=$(grep -oE 'version="[0-9][0-9.]*"' \
+              /tmp/fc_pkg_expanded/Distribution 2>/dev/null \
+              | head -1 | grep -oE '[0-9][0-9.]*')
+          fi
+
+          # Fallback: parse the version from the DMG volume label
+          if [ -z "$VERSION" ]; then
+            VERSION=$(echo "$VOLUME" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+          fi
+
+          # Last resort: use today's date so the workflow never hard-fails
+          if [ -z "$VERSION" ]; then
+            VERSION=$(date +%Y.%m.%d)
+            echo "WARNING: Could not detect version — using date fallback: $VERSION"
+          fi
+
+          echo "Detected version: $VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      # ── 4. Check for duplicate release ──────────────────────────────────────
+      - name: Check if release already exists
+        id: check_release
+        run: |
+          TAG="v${{ env.VERSION }}"
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+
+          if [ "$HTTP" = "200" ] && [ "${{ inputs.force_release }}" != "true" ]; then
+            echo "Release $TAG already exists — skipping."
+            echo "SKIP=true" >> $GITHUB_OUTPUT
+          else
+            echo "SKIP=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 5. Copy + rename the package ────────────────────────────────────────
+      - name: Extract and rename PKG
+        if: steps.check_release.outputs.SKIP != 'true'
+        run: |
+          # Locate the .mpkg (name may vary slightly between versions)
+          MPKG=$(find "$VOLUME" -name "*.mpkg" | head -1)
+
+          if [ -z "$MPKG" ]; then
+            echo "ERROR: No .mpkg found in $VOLUME"
+            ls -laR "$VOLUME"
+            exit 1
+          fi
+
+          echo "Found: $MPKG"
+          PKG_NAME="FortiClientVPN-${{ env.VERSION }}.pkg"
+          cp "$MPKG" "$PKG_NAME"
+          ls -lh "$PKG_NAME"
+          echo "PKG_NAME=$PKG_NAME" >> $GITHUB_ENV
+
+      # ── 6. Publish release ───────────────────────────────────────────────────
+      - name: Create GitHub Release
+        if: steps.check_release.outputs.SKIP != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: "FortiClient VPN ${{ env.VERSION }}"
+          body: |
+            **FortiClient VPN** — macOS offline installer PKG
+
+            | Field | Value |
+            |---|---|
+            | Version | `${{ env.VERSION }}` |
+            | Built | `${{ github.run_id }}` |
+            | Trigger | `${{ github.event_name }}` |
+
+            > Extracted from the official Fortinet DMG for MDM/Mosyle deployment.
+            > Deploy via **MDM > Apps > In-House App** using the direct asset URL below.
+          files: ${{ env.PKG_NAME }}
+
+      # ── 7. Cleanup (always runs) ─────────────────────────────────────────────
+      - name: Detach DMG
+        if: always()
+        run: |
+          hdiutil detach "${{ env.VOLUME }}" -quiet 2>/dev/null || true
