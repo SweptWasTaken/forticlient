@@ -105,32 +105,33 @@ jobs:
           cat /tmp/fc_installer.log
 
 
-      # ── 4. Parse the downloaded full-installer DMG path from log output ──────
+# ── 4. Parse the downloaded full-installer DMG path from log ──────────────
       - name: Parse full installer DMG path from log
         run: |
-          # Target log line:
-          # "Download FortiClient Connect successfully. Copy it to /var/folders/.../FortiClient.dmg"
           FULL_DMG=$(grep "Copy it to" /tmp/fc_installer.log \
             | grep -oE '/var/folders/[^ ]+' \
             | tail -1)
 
-          # Fallback: scan /var/folders for any FortiClient DMG newer than the stub
+          # Fallback: sudo find (also needed since root owns /var/folders/zz/...)
           if [ -z "$FULL_DMG" ]; then
-            echo "Primary parse found nothing — falling back to filesystem search..."
-            FULL_DMG=$(find /var/folders -name "FortiClient*.dmg" \
-              -newer FortiClientStub.dmg 2>/dev/null | head -1)
+            echo "Primary parse found nothing — falling back to sudo find..."
+            FULL_DMG=$(sudo find /var/folders -name "FortiClient*.dmg" 2>/dev/null | head -1)
           fi
 
-          if [ -z "$FULL_DMG" ] || [ ! -f "$FULL_DMG" ]; then
+          if [ -z "$FULL_DMG" ]; then
             echo "ERROR: Could not locate downloaded FortiClient DMG."
-            echo "Full installer log:"
             cat /tmp/fc_installer.log
             exit 1
           fi
 
-          echo "Full installer DMG: $FULL_DMG"
-          ls -lh "$FULL_DMG"
-          echo "FULL_DMG=$FULL_DMG" >> $GITHUB_ENV
+          echo "Found at: $FULL_DMG"
+
+          # The file is root-owned — copy it somewhere the runner user can access
+          sudo cp "$FULL_DMG" /tmp/FortiClientFull.dmg
+          sudo chmod 644 /tmp/FortiClientFull.dmg
+
+          ls -lh /tmp/FortiClientFull.dmg
+          echo "FULL_DMG=/tmp/FortiClientFull.dmg" >> $GITHUB_ENV
 
       # ── 5. Mount the full installer DMG ─────────────────────────────────────
       - name: Mount full installer DMG
