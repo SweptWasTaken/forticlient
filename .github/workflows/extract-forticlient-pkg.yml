@@ -114,7 +114,6 @@ jobs:
       - name: Extract and rename PKG
         if: steps.check_release.outputs.SKIP != 'true'
         run: |
-          # Locate the .mpkg (name may vary slightly between versions)
           MPKG=$(find "$VOLUME" -name "*.mpkg" | head -1)
 
           if [ -z "$MPKG" ]; then
@@ -124,7 +123,8 @@ jobs:
           fi
 
           echo "Found: $MPKG"
-          PKG_NAME="FortiClientVPN-${{ env.VERSION }}.pkg"
+          # Fixed filename — this is what makes the /latest/download/ URL stable
+          PKG_NAME="FortiClientVPN.pkg"
           cp "$MPKG" "$PKG_NAME"
           ls -lh "$PKG_NAME"
           echo "PKG_NAME=$PKG_NAME" >> $GITHUB_ENV
@@ -136,17 +136,7 @@ jobs:
         with:
           tag_name: v${{ env.VERSION }}
           name: "FortiClient VPN ${{ env.VERSION }}"
-          body: |
-            **FortiClient VPN** — macOS offline installer PKG
-
-            | Field | Value |
-            |---|---|
-            | Version | `${{ env.VERSION }}` |
-            | Built | `${{ github.run_id }}` |
-            | Trigger | `${{ github.event_name }}` |
-
-            > Extracted from the official Fortinet DMG for MDM/Mosyle deployment.
-            > Deploy via **MDM > Apps > In-House App** using the direct asset URL below.
+          make_latest: true   # ← ensures /releases/latest/ always points here
           files: ${{ env.PKG_NAME }}
 
       # ── 7. Cleanup (always runs) ─────────────────────────────────────────────
