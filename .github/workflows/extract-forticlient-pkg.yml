@@ -213,7 +213,21 @@ jobs:
           cp "$PKG_SRC" FortiClientVPN.pkg
           ls -lh FortiClientVPN.pkg
 
-      # ── 9. Create GitHub Release ──────────────────────────────────────────────
+      # ── 9. Verify PKG signature ───────────────────────────────────────────────
+      - name: Verify PKG signature
+        if: steps.check_release.outputs.SKIP != 'true'
+        run: |
+          echo "=== PKG Signature Check ==="
+
+          if pkgutil --check-signature FortiClientVPN.pkg; then
+            echo ""
+            echo "✅ PKG is signed."
+          else
+            echo ""
+            echo "❌ PKG is NOT signed."
+          fi
+
+      # ── 10. Create GitHub Release ──────────────────────────────────────────────
       - name: Create GitHub Release
         if: steps.check_release.outputs.SKIP != 'true'
         uses: softprops/action-gh-release@v2
@@ -236,7 +250,7 @@ jobs:
             > `https://github.com/${{ github.repository }}/releases/latest/download/FortiClientVPN.pkg`
           files: FortiClientVPN.pkg
 
-      # ── 10. Cleanup (always runs) ─────────────────────────────────────────────
+      # ── 11. Cleanup (always runs) ─────────────────────────────────────────────
       - name: Detach DMG volumes
         if: always()
         run: |
