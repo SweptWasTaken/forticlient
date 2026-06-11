@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
     inputs:
       download_url:
-        description: "Direct stub DMG download URL (from Fortinet downloads page)"
-        required: true
+        description: "Download URL override (leave blank to use the FORTICLIENT_DMG_URL repo variable)"
+        required: false
         type: string
       force_release:
         description: "Re-release even if this version tag already exists"
@@ -26,11 +26,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-# ── 1. Resolve redirect and extract version ──────────────────────────────
+      # ── 1. Resolve redirect and extract version ──────────────────────────────
       #
       # https://links.fortinet.com/forticlient/mac/vpnagent redirects to a URL like:
       # https://filestore.fortinet.com/forticlient/downloads/FortiClientVPN_7.4.3.4323_OnlineInstaller.dmg
-      # The version lives in that final URL — no need to inspect the PKG at all.
+      # The version lives in that final URL.
       #
       - name: Resolve download URL and detect version
         run: |
@@ -79,21 +79,85 @@ jobs:
       - name: Download FortiClient stub installer DMG
         if: steps.check_release.outputs.SKIP != 'true'
         run: |
-          # Use the already-resolved URL directly — no second redirect needed
           echo "Downloading $FINAL_URL"
           curl -L --retry 3 --retry-delay 10 --progress-bar \
             -o FortiClientStub.dmg "$FINAL_URL"
 
           ls -lh FortiClientStub.dmg
 
-# ── 4. Parse the downloaded full-installer DMG path from log ──────────────
+      # ── 4. Mount stub DMG ────────────────────────────────────────────────────
+      - name: Mount stub DMG
+        if: steps.check_release.outputs.SKIP != 'true'
+        run: |
+          ATTACH_OUT=$(hdiutil attach FortiClientStub.dmg -nobrowse -noverify)
+          echo "$ATTACH_OUT"
+
+          STUB_VOLUME=$(echo "$ATTACH_OUT" | awk '/\/Volumes\//{print $NF}')
+          if [ -z "$STUB_VOLUME" ]; then
+            echo "ERROR: Could not determine stub DMG mount point."
+            exit 1
+          fi
+
+          echo "Stub mounted at: $STUB_VOLUME"
+          echo "STUB_VOLUME=$STUB_VOLUME" >> $GITHUB_ENV
+
+      # ── 5. Run FortiClientInstaller binary to download the full installer ────
+      #
+      # The binary never exits on its own — run it in the background, poll the
+      # log for the "Copy it to" line, then kill it once we have the path.
+      #
+      - name: Run FortiClientInstaller binary
+        if: steps.check_release.outputs.SKIP != 'true'
+        timeout-minutes: 15
+        run: |
+          INSTALLER=$(find "$STUB_VOLUME" -name "FortiClientInstaller" -type f | head -1)
+
+          if [ -z "$INSTALLER" ]; then
+            echo "ERROR: FortiClientInstaller binary not found under $STUB_VOLUME"
+            find "$STUB_VOLUME" -type f
+            exit 1
+          fi
+
+          echo "Found binary: $INSTALLER"
+
+          # Touch the log file first so the parse step always has a file to read
+          touch /tmp/fc_installer.log
+
+          sudo "$INSTALLER" > /tmp/fc_installer.log 2>&1 &
+          FC_PID=$!
+          echo "Installer running as PID $FC_PID"
+
+          TIMEOUT=600
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            if grep -q "Copy it to" /tmp/fc_installer.log 2>/dev/null; then
+              echo "Download complete after ${ELAPSED}s."
+              break
+            fi
+            sleep 10
+            ELAPSED=$((ELAPSED + 10))
+            echo "  ...waiting (${ELAPSED}s elapsed)"
+          done
+
+          sudo kill "$FC_PID" 2>/dev/null || true
+
+          if ! grep -q "Copy it to" /tmp/fc_installer.log; then
+            echo "ERROR: Timed out waiting for download. Installer log:"
+            cat /tmp/fc_installer.log
+            exit 1
+          fi
+
+          echo "=== Installer output ==="
+          cat /tmp/fc_installer.log
+
+      # ── 6. Parse the downloaded full-installer DMG path from log ─────────────
       - name: Parse full installer DMG path from log
+        if: steps.check_release.outputs.SKIP != 'true'
         run: |
           FULL_DMG=$(grep "Copy it to" /tmp/fc_installer.log \
             | grep -oE '/var/folders/[^ ]+' \
             | tail -1)
 
-          # Fallback: sudo find (also needed since root owns /var/folders/zz/...)
           if [ -z "$FULL_DMG" ]; then
             echo "Primary parse found nothing — falling back to sudo find..."
             FULL_DMG=$(sudo find /var/folders -name "FortiClient*.dmg" 2>/dev/null | head -1)
@@ -101,21 +165,23 @@ jobs:
 
           if [ -z "$FULL_DMG" ]; then
             echo "ERROR: Could not locate downloaded FortiClient DMG."
+            echo "Full installer log:"
             cat /tmp/fc_installer.log
             exit 1
           fi
 
           echo "Found at: $FULL_DMG"
 
-          # The file is root-owned — copy it somewhere the runner user can access
+          # File is root-owned — copy it somewhere the runner user can access
           sudo cp "$FULL_DMG" /tmp/FortiClientFull.dmg
           sudo chmod 644 /tmp/FortiClientFull.dmg
 
           ls -lh /tmp/FortiClientFull.dmg
           echo "FULL_DMG=/tmp/FortiClientFull.dmg" >> $GITHUB_ENV
 
-      # ── 5. Mount the full installer DMG ─────────────────────────────────────
+      # ── 7. Mount the full installer DMG ──────────────────────────────────────
       - name: Mount full installer DMG
+        if: steps.check_release.outputs.SKIP != 'true'
         run: |
           ATTACH_OUT=$(hdiutil attach "$FULL_DMG" -nobrowse -noverify)
           echo "$ATTACH_OUT"
@@ -130,43 +196,24 @@ jobs:
           ls -la "$FULL_VOLUME"
           echo "FULL_VOLUME=$FULL_VOLUME" >> $GITHUB_ENV
 
-      # ── 6. Detect version ────────────────────────────────────────────────────
-      - name: Detect version
-        run: |
-          PKG_SRC=$(find "$FULL_VOLUME" \( -name "*.pkg" -o -name "*.mpkg" \) | head -1)
-          echo "PKG source: $PKG_SRC"
-
-          # Best source: Distribution XML inside the package
-          pkgutil --expand "$PKG_SRC" /tmp/fc_expanded 2>/dev/null || true
-          VERSION=$(grep -oE 'version="[0-9][0-9.]*"' \
-            /tmp/fc_expanded/Distribution 2>/dev/null \
-            | head -1 | grep -oE '[0-9][0-9.]*')
-
-          # Fallback: parse from the DMG volume label
-          if [ -z "$VERSION" ]; then
-            VERSION=$(echo "$FULL_VOLUME" \
-              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
-          fi
-
-          # Last resort: date stamp so the workflow never hard-fails
-          if [ -z "$VERSION" ]; then
-            VERSION=$(date +%Y.%m.%d)
-            echo "WARNING: Version not detected — using date fallback: $VERSION"
-          fi
-
-          echo "Detected version: $VERSION"
-          echo "VERSION=$VERSION"   >> $GITHUB_ENV
-          echo "PKG_SRC=$PKG_SRC"  >> $GITHUB_ENV
-
-      # ── 8. Copy PKG with stable filename ────────────────────────────────────
+      # ── 8. Stage PKG with stable filename ────────────────────────────────────
       - name: Stage PKG with stable filename
         if: steps.check_release.outputs.SKIP != 'true'
         run: |
+          PKG_SRC=$(find "$FULL_VOLUME" \( -name "*.pkg" -o -name "*.mpkg" \) | head -1)
+
+          if [ -z "$PKG_SRC" ]; then
+            echo "ERROR: No .pkg or .mpkg found in $FULL_VOLUME"
+            ls -laR "$FULL_VOLUME"
+            exit 1
+          fi
+
+          echo "Found: $PKG_SRC"
           # Fixed filename is what makes /releases/latest/download/FortiClientVPN.pkg stable
           cp "$PKG_SRC" FortiClientVPN.pkg
           ls -lh FortiClientVPN.pkg
 
-      # ── 9. Publish GitHub Release ────────────────────────────────────────────
+      # ── 9. Create GitHub Release ──────────────────────────────────────────────
       - name: Create GitHub Release
         if: steps.check_release.outputs.SKIP != 'true'
         uses: softprops/action-gh-release@v2
@@ -189,7 +236,7 @@ jobs:
             > `https://github.com/${{ github.repository }}/releases/latest/download/FortiClientVPN.pkg`
           files: FortiClientVPN.pkg
 
-      # ── 10. Cleanup (always runs) ────────────────────────────────────────────
+      # ── 10. Cleanup (always runs) ─────────────────────────────────────────────
       - name: Detach DMG volumes
         if: always()
         run: |
